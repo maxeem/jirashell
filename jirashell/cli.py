@@ -162,7 +162,9 @@ def run_configure(existing=None):
 COMMANDS = [
     "search", "list", "mine", "select", "tickets", "view",
     "next", "prev", "back", "home", "refresh",
-    "create", "transition", "comment", "help", "exit", "quit",
+    "create", "transition", "comment",
+    "boards", "board",
+    "help", "exit", "quit",
 ]
 
 def _completer(text, state):
@@ -311,6 +313,10 @@ class JiraCLI:
                 parts.append("mine")
             elif v.state == "ticket":
                 parts.append(v.context.get("ticket_key", "?"))
+            elif v.state == "boards":
+                parts.append("boards")
+            elif v.state == "kanban":
+                parts.append(f"board:{v.context.get('board_name', '?')}")
         return " > ".join(parts) + " $ "
 
     def _dispatch(self, raw: str):
@@ -323,8 +329,10 @@ class JiraCLI:
             state = self.nav_stack[-1].state
             if state == "epics":
                 self.cmd_select(parts)
-            elif state == "tickets":
+            elif state in ("tickets", "mine", "kanban"):
                 self.cmd_view(parts)
+            elif state == "boards":
+                self.cmd_board(parts)
             else:
                 print("Type a command. Use 'help' for options.")
             return
@@ -343,6 +351,8 @@ class JiraCLI:
             "create": self.cmd_create,
             "transition": lambda _: self.cmd_transition(),
             "comment": lambda _: self.cmd_comment(),
+            "boards": self.cmd_boards,
+            "board": self.cmd_board,
             "refresh": lambda _: self.cmd_refresh(),
             "help": lambda _: self.cmd_help(),
             "exit": lambda _: (print("Goodbye."), sys.exit(0)),
@@ -538,9 +548,36 @@ class JiraCLI:
 
     def cmd_view(self, args: list[str]):
         view = self.nav_stack[-1]
-        if view.state not in ("tickets", "mine") or not view.data:
-            print("No ticket list loaded. Select an epic first.")
+        if view.state not in ("tickets", "mine", "kanban") or not view.data:
+            print("No ticket list loaded. Select an epic or board first.")
             return
+
+        if view.state == "kanban":
+            flat = view.context.get("flat_issues", [])
+            try:
+                idx = int(args[0]) - 1
+                if not (0 <= idx < len(flat)):
+                    raise ValueError()
+            except (IndexError, ValueError):
+                print(f"Enter a number between 1 and {len(flat)}.")
+                return
+            ticket = flat[idx]
+            key = ticket["key"]
+            print(f"Loading {key}...")
+            try:
+                details = self.client.get_ticket(key)
+            except Exception as e:
+                print(f"Error: {e}")
+                return
+            self.nav_stack.append(View(
+                state="ticket",
+                data=details,
+                context={"ticket_key": key, "ticket_idx": idx},
+                cache_key=f"ticket|{key}",
+            ))
+            self._display_current()
+            return
+
         try:
             idx = int(args[0]) - 1
             if not (0 <= idx < len(view.data)):
@@ -565,6 +602,81 @@ class JiraCLI:
             cache_key=f"ticket|{key}",
         ))
         self._display_current()
+
+    def cmd_boards(self, args: list[str]):
+        project = args[0].upper() if args else None
+        label = f" for project {project}" if project else ""
+        print(f"Fetching kanban boards{label}...")
+        try:
+            boards = self.client.get_boards(project_key=project)
+        except Exception as e:
+            print(f"Error: {e}")
+            return
+        view = View(
+            state="boards",
+            data=boards,
+            context={"project": project},
+            cache_key=f"boards|{project}",
+        )
+        self.nav_stack.append(view)
+        self._display_current()
+
+    def cmd_board(self, args: list[str]):
+        view = self.nav_stack[-1]
+        if view.state != "boards" or not view.data:
+            print("No board list loaded. Use 'boards' first.")
+            return
+        try:
+            idx = int(args[0]) - 1
+            if not (0 <= idx < len(view.data)):
+                raise ValueError()
+        except (IndexError, ValueError):
+            print(f"Enter a number between 1 and {len(view.data)}.")
+            return
+
+        board = view.data[idx]
+        board_id = board["id"]
+        board_name = board["name"]
+        print(f"Loading board [{board_name}]...")
+        try:
+            config = self.client.get_board_config(board_id)
+            issues = self.client.get_board_issues(board_id)
+        except Exception as e:
+            print(f"Error: {e}")
+            return
+
+        columns, flat = self._build_kanban_columns(config, issues)
+        self.nav_stack.append(View(
+            state="kanban",
+            data=columns,
+            context={"board_id": board_id, "board_name": board_name, "flat_issues": flat},
+            cache_key=f"board_issues|{board_id}",
+        ))
+        self._display_current()
+
+    def _build_kanban_columns(self, config, issues):
+        columns_cfg = config.get("columnConfig", {}).get("columns", [])
+        status_to_col = {}
+        for col in columns_cfg:
+            for s in col.get("statuses", []):
+                status_to_col[s["id"]] = col["name"]
+
+        col_issues: dict[str, list] = {col["name"]: [] for col in columns_cfg}
+        uncategorized = []
+        for issue in issues:
+            status_id = issue["fields"].get("status", {}).get("id")
+            col_name = status_to_col.get(status_id)
+            if col_name and col_name in col_issues:
+                col_issues[col_name].append(issue)
+            else:
+                uncategorized.append(issue)
+
+        columns = [{"name": col["name"], "issues": col_issues[col["name"]]} for col in columns_cfg]
+        if uncategorized:
+            columns.append({"name": "Other", "issues": uncategorized})
+
+        flat = [issue for col in columns for issue in col["issues"]]
+        return columns, flat
 
     def cmd_next(self):
         view = self.nav_stack[-1]
@@ -746,6 +858,32 @@ class JiraCLI:
     def cmd_refresh(self):
         view = self.nav_stack[-1]
         self.client.invalidate(view.cache_key)
+        if view.state == "boards":
+            try:
+                view.data = self.client.get_boards(project_key=view.context.get("project"))
+            except Exception as e:
+                print(f"Error: {e}")
+                return
+            view.page = 0
+            print("Refreshed.\n")
+            self._display_current()
+            return
+        if view.state == "kanban":
+            board_id = view.context["board_id"]
+            self.client.invalidate(f"board_config|{board_id}")
+            try:
+                config = self.client.get_board_config(board_id)
+                issues = self.client.get_board_issues(board_id)
+                columns, flat = self._build_kanban_columns(config, issues)
+                view.data = columns
+                view.context["flat_issues"] = flat
+            except Exception as e:
+                print(f"Error: {e}")
+                return
+            view.page = 0
+            print("Refreshed.\n")
+            self._display_current()
+            return
         if view.state == "epics":
             ctx = view.context
             try:
@@ -795,6 +933,8 @@ class JiraCLI:
     create ticket         Create a ticket inside the current epic (Story/Task/Bug)
     transition            Move the current ticket to a new status (ticket view only)
     comment               Add a comment to the current ticket (ticket view only)
+    boards [<project>]    List kanban boards, optionally filtered by project key
+    board <number>        Open a kanban board (or just type the number in boards view)
     back                  Return to the previous view
     home                  Jump back to the top level in one step
     refresh               Re-fetch data for the current view
@@ -802,6 +942,9 @@ class JiraCLI:
     exit / quit           Exit the CLI
 
   Examples:
+    boards                            List all kanban boards
+    boards PROJ                       Boards for project PROJ
+    board 1                           Open the first board in kanban view
     mine                              Show all tickets assigned to you
     mine last 2 weeks                 Your tickets updated in the last 2 weeks
     search ceph last 6 months         Ceph epics created in the last 6 months
@@ -819,13 +962,17 @@ class JiraCLI:
     def _display_current(self):
         view = self.nav_stack[-1]
         if view.state == "home":
-            print("  Type 'list' to see recent epics, 'mine' for your tickets, or 'search <keyword>' to find specific ones.")
+            print("  Type 'list' to see recent epics, 'mine' for your tickets, 'boards' for kanban boards, or 'search <keyword>' to find specific ones.")
         elif view.state == "epics":
             self._display_epics(view)
         elif view.state in ("tickets", "mine"):
             self._display_tickets(view)
         elif view.state == "ticket":
             self._display_ticket(view)
+        elif view.state == "boards":
+            self._display_boards(view)
+        elif view.state == "kanban":
+            self._display_kanban(view)
 
     def _display_epics(self, view: View):
         data = view.data
@@ -892,6 +1039,57 @@ class JiraCLI:
         else:
             print("  Type 'view <number>' (or just the number) to see full details.")
         print()
+
+    def _display_boards(self, view: View):
+        data = view.data
+        if not data:
+            print("  No kanban boards found. Try 'boards <project>' to filter by project.")
+            return
+        print(f"\n  {'#':<5} {'ID':<8} {'Type':<12} Name")
+        print("  " + "─" * 60)
+        for i, board in enumerate(data, 1):
+            bid = str(board.get("id", ""))
+            btype = board.get("type", "").capitalize()
+            name = truncate(board.get("name", ""), 38)
+            print(f"  {i:<5} {bid:<8} {btype:<12} {name}")
+        print("  " + "─" * 60)
+        print(f"  {len(data)} board(s)  |  Type 'board <number>' (or just the number) to open.\n")
+
+    def _display_kanban(self, view: View):
+        board_name = view.context.get("board_name", "")
+        columns = view.data
+        if not columns:
+            print("  No columns found for this board.")
+            return
+
+        print(f"\n  Board: {board_name}\n")
+
+        counter = 1
+        max_per_col = 12
+        for col in columns:
+            issues = col["issues"]
+            col_name = col["name"]
+            count = len(issues)
+            header = f"  ── {color_status(col_name)} "
+            fill = "─" * max(0, 74 - len(col_name) - 4)
+            print(f"{header}{fill}  ({count})")
+            if not issues:
+                print("  (empty)\n")
+                continue
+            shown = issues[:max_per_col]
+            for issue in shown:
+                f = issue["fields"]
+                key = issue["key"]
+                summary = truncate(f.get("summary", ""), 52)
+                print(f"  {counter:<4} {key:<14} {summary}")
+                counter += 1
+            remaining = count - len(shown)
+            if remaining > 0:
+                print(f"       … {remaining} more (use 'refresh' to reload)")
+            print()
+
+        total = sum(len(c["issues"]) for c in columns)
+        print(f"  {total} issue(s) total. Type 'view <number>' to open a ticket, 'back' to return.\n")
 
     def _display_ticket(self, view: View):
         data = view.data

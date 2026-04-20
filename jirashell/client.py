@@ -6,6 +6,7 @@ from requests.auth import HTTPBasicAuth
 class JiraClient:
     def __init__(self, domain, email, api_key):
         self.base_url = f"https://{domain}.atlassian.net/rest/api/3"
+        self.agile_base_url = f"https://{domain}.atlassian.net/rest/agile/1.0"
         self.auth = HTTPBasicAuth(email, api_key)
         self.headers = {"Accept": "application/json"}
         self._cache = {}  # key -> (timestamp, data)
@@ -16,6 +17,12 @@ class JiraClient:
 
     def _get(self, endpoint, params=None):
         url = f"{self.base_url}/{endpoint}"
+        resp = requests.get(url, headers=self.headers, auth=self.auth, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _agile_get(self, endpoint, params=None):
+        url = f"{self.agile_base_url}/{endpoint}"
         resp = requests.get(url, headers=self.headers, auth=self.auth, params=params)
         resp.raise_for_status()
         return resp.json()
@@ -212,6 +219,43 @@ class JiraClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    def get_boards(self, project_key=None):
+        params = {"maxResults": 50, "type": "kanban"}
+        if project_key:
+            params["projectKeyOrId"] = project_key
+        cache_key = f"boards|{project_key}"
+        return self._cached(cache_key, ttl=300, fn=lambda: (
+            self._agile_get("board", params=params).get("values", [])
+        ))
+
+    def get_board_config(self, board_id):
+        cache_key = f"board_config|{board_id}"
+        return self._cached(cache_key, ttl=300, fn=lambda: (
+            self._agile_get(f"board/{board_id}/configuration")
+        ))
+
+    def get_board_issues(self, board_id):
+        cache_key = f"board_issues|{board_id}"
+
+        def fetch():
+            all_issues = []
+            start = 0
+            while True:
+                data = self._agile_get(f"board/{board_id}/issue", params={
+                    "startAt": start,
+                    "maxResults": 100,
+                    "fields": "summary,status,assignee,priority,issuetype",
+                })
+                issues = data.get("issues", [])
+                all_issues.extend(issues)
+                total = data.get("total", 0)
+                if not issues or len(all_issues) >= total:
+                    break
+                start += len(issues)
+            return all_issues
+
+        return self._cached(cache_key, ttl=120, fn=fetch)
 
     def invalidate(self, key=None):
         if key:
