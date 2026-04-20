@@ -1013,6 +1013,7 @@ class JiraCLI:
 
         if not data:
             print("  No tickets found in this epic.")
+            print("  Use 'back' to return to epics, 'home' to start over, or 'refresh' to retry.")
             print()
             return
 
