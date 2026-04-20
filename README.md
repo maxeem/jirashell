@@ -44,6 +44,14 @@ jirashell
 | `home` | Jump back to the top level |
 | `refresh` | Re-fetch data for the current view |
 
+### Kanban boards
+
+| Command | Description |
+|---|---|
+| `boards [<project>]` | List kanban boards, optionally filtered by project key |
+| `board <number>` | Open a board in kanban view (or just type the number) |
+| `view <number>` | Open a ticket from the kanban view |
+
 ### Creating issues
 
 | Command | Description |
@@ -72,6 +80,9 @@ home > epics:payments > PAY-42 > PAY-107 $ transition
 home > epics:payments > PAY-42 > PAY-107 $ comment
 home > epics:payments > PAY-42 > PAY-107 $ back
 home $ mine last 2 weeks
+home $ boards
+home > boards $ board 1
+home > boards > board:My Board $ view 3
 ```
 
 ## Requirements
